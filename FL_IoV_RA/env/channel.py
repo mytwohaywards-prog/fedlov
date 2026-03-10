@@ -29,6 +29,10 @@ class ChannelModel:
         # Interference matrix
         self.interference = np.zeros((n_vehicles, n_rb))
 
+        # ========== 新增: 干扰信道矩阵 (公式6中的ḡ_{k',k}[m]) ==========
+        # 从vehicle j到vehicle i的信道增益 (用于干扰计算)
+        self.interference_channel_gain = np.ones((n_vehicles, n_vehicles, n_rb))
+
         # Positions
         self.positions = None  # Will be set by environment
 
@@ -43,6 +47,7 @@ class ChannelModel:
         self._update_shadowing_initial()
         self._update_fading()
         self._compute_channel_gains()
+        self._compute_interference_channels()  # 新增
 
     def update(self, positions: np.ndarray):
         """
@@ -55,17 +60,20 @@ class ChannelModel:
         self._update_shadowing_smooth()
         self._update_fading()
         self._compute_channel_gains()
+        self._compute_interference_channels()  # 新增
 
     def _update_path_loss(self):
         """
-        Calculate path loss based on distance
-        Model: PL(d) = PL_0 + 10*n*log10(d/d_0)
-        where PL_0 = reference path loss at 1m, n = path loss exponent
+        Calculate path loss based on distance using 3GPP model
+        严格遵循论文Table II的双层路径损耗模型
+
+        V2V Link (LOS/NLOS):
+        LOS:  PL(dB) = 38.77 + 16.7*log10(d) + 18.2*log10(fc)
+        NLOS: PL(dB) = 36.85 + 30*log10(d) + 18.9*log10(fc)
+
+        其中 d 为距离(meters), fc 为频率(GHz)
         """
-        d0 = 1.0  # reference distance in meters
-        # Reference path loss at 1m: PL(1m) = 20*log10(f) + 20*log10(4π/c) - 20
-        f_GHz = self.config.CARRIER_FREQUENCY / 1e9
-        PL_0_dB = 20 * np.log10(f_GHz) + 20 * np.log10(4 * np.pi / 3e8) - 20
+        fc_GHz = self.config.CARRIER_FREQUENCY / 1e9  # 转换为GHz (4.7 GHz)
 
         # Calculate distances (all pairs)
         for i in range(self.n_vehicles):
@@ -74,30 +82,80 @@ class ChannelModel:
                     dist = np.linalg.norm(self.positions[i] - self.positions[j])
                     dist = max(dist, self.config.MIN_DISTANCE)
                 else:
-                    # Self-interference from base station/RSU
-                    dist = 100  # fixed distance to RSU
+                    # Self-link to RSU
+                    dist = 100.0
 
-                path_loss_db = PL_0_dB + 10 * self.config.PATH_LOSS_EXPONENT * np.log10(dist / d0)
+                # 判断LOS/NLOS状态
+                # 论文: V2V同一条道路上时为LOS，概率为plos(d) = ... (简化：距离小于50m为LOS)
+                is_los = dist < 50.0
 
-                # Apply to all RBs (same path loss per RB in this simplified model)
+                # 应用3GPP路径损耗公式 (论文Table II)
+                if is_los:
+                    # LOS model
+                    path_loss_db = 38.77 + 16.7 * np.log10(dist) + 18.2 * np.log10(fc_GHz)
+                else:
+                    # NLOS model
+                    path_loss_db = 36.85 + 30 * np.log10(dist) + 18.9 * np.log10(fc_GHz)
+
+                # Apply to all RBs (path loss不随RB变化)
                 for rb in range(self.n_rb):
                     self.path_loss[i, rb] = path_loss_db
 
     def _update_shadowing_initial(self):
-        """Initialize shadowing with random values"""
-        self.shadowing_state = np.random.normal(0, self.config.SHADOWING_STD,
-                                               (self.n_vehicles, self.n_rb))
+        """
+        Initialize shadowing with proper LOS/NLOS standards
+        论文Table II: LOS下σ=3dB, NLOS下σ=4dB
+        """
+        # 先计算LOS/NLOS状态（与_update_path_loss中的逻辑一致）
+        los_matrix = np.zeros((self.n_vehicles, self.n_rb), dtype=bool)
+        for i in range(self.n_vehicles):
+            for j in range(self.n_vehicles):
+                if i != j:
+                    dist = np.linalg.norm(self.positions[i] - self.positions[j])
+                    dist = max(dist, self.config.MIN_DISTANCE)
+                    los_matrix[i, :] = (dist < 50.0)
+
+        # 根据LOS/NLOS应用不同的标准差
+        self.shadowing_state = np.zeros((self.n_vehicles, self.n_rb))
+        for i in range(self.n_vehicles):
+            for rb in range(self.n_rb):
+                if los_matrix[i, rb]:
+                    # LOS: σ = 3 dB
+                    self.shadowing_state[i, rb] = np.random.normal(0, self.config.SHADOWING_STD)
+                else:
+                    # NLOS: σ = 4 dB
+                    self.shadowing_state[i, rb] = np.random.normal(0, self.config.SHADOWING_STD_NLOS)
+
         self.shadowing = self.shadowing_state.copy()
 
     def _update_shadowing_smooth(self):
         """
         Update shadowing with exponential correlation
-        Models the slow variation of shadowing across time slots
+        论文Table II: 每100ms更新一次 (SLOT_DURATION=100ms)
+        当前在每个step调用，实现smooth fading
         """
         correlation_coef = 0.9  # correlation between slots
-        new_shadowing = (correlation_coef * self.shadowing_state +
-                        (1 - correlation_coef) * np.random.normal(0, self.config.SHADOWING_STD,
-                                                                   (self.n_vehicles, self.n_rb)))
+
+        # 计算当前LOS/NLOS状态
+        los_matrix = np.zeros((self.n_vehicles, self.n_rb), dtype=bool)
+        for i in range(self.n_vehicles):
+            for j in range(self.n_vehicles):
+                if i != j:
+                    dist = np.linalg.norm(self.positions[i] - self.positions[j])
+                    dist = max(dist, self.config.MIN_DISTANCE)
+                    los_matrix[i, :] = (dist < 50.0)
+
+        # 根据LOS/NLOS选择不同的标准差进行更新
+        new_shadowing = np.zeros((self.n_vehicles, self.n_rb))
+        for i in range(self.n_vehicles):
+            for rb in range(self.n_rb):
+                if los_matrix[i, rb]:
+                    shadowing_std = self.config.SHADOWING_STD  # 3 dB for LOS
+                else:
+                    shadowing_std = self.config.SHADOWING_STD_NLOS  # 4 dB for NLOS
+
+                new_shadowing[i, rb] = (correlation_coef * self.shadowing_state[i, rb] +
+                                       (1 - correlation_coef) * np.random.normal(0, shadowing_std))
         self.shadowing_state = new_shadowing
         self.shadowing = self.shadowing_state.copy()
 
@@ -129,6 +187,51 @@ class ChannelModel:
 
         self.channel_gain = PL_linear * shadowing_linear * fading_power
 
+    def _compute_interference_channels(self):
+        """
+        计算干扰信道增益矩阵 (公式6中的ḡ_{k',k}[m])
+
+        从vehicle j到vehicle i的信道增益，用于计算vehicle i收到的干扰
+
+        对于每对(i, j)，计算基于i-j之间的距离的路径损耗
+        """
+        fc_GHz = self.config.CARRIER_FREQUENCY / 1e9
+
+        for i in range(self.n_vehicles):
+            for j in range(self.n_vehicles):
+                if i == j:
+                    # 自环：vehicle自己到自己的信道
+                    for rb in range(self.n_rb):
+                        self.interference_channel_gain[j, i, rb] = self.channel_gain[i, rb]
+                else:
+                    # j到i的干扰信道
+                    dist = np.linalg.norm(self.positions[i] - self.positions[j])
+                    dist = max(dist, self.config.MIN_DISTANCE)
+
+                    # 判断LOS/NLOS
+                    is_los = dist < 50.0
+
+                    # 路径损耗
+                    if is_los:
+                        path_loss_db = 38.77 + 16.7 * np.log10(dist) + 18.2 * np.log10(fc_GHz)
+                    else:
+                        path_loss_db = 36.85 + 30 * np.log10(dist) + 18.9 * np.log10(fc_GHz)
+
+                    # 将路径损耗转换为线性
+                    pl_linear = 10 ** (-path_loss_db / 10)
+
+                    # 阴影衰落：对于j到i的链路，使用近似阴影值
+                    # (简化：假设与i的本地阴影相同)
+                    shadowing_linear = 10 ** (-self.shadowing[i] / 10)
+
+                    # 快衰落：对于干扰链路，生成新的独立衰落
+                    # (为了简化，使用与main channel相同的fading)
+                    fading_power = self.fading[j] ** 2
+
+                    # 完整干扰信道增益
+                    for rb in range(self.n_rb):
+                        self.interference_channel_gain[j, i, rb] = pl_linear * shadowing_linear[rb] * fading_power[rb]
+
     def get_channel_gain(self, vehicle_idx: int = None) -> np.ndarray:
         """
         Get channel gain for vehicles
@@ -143,11 +246,16 @@ class ChannelModel:
 
     def compute_sinr(self, power_linear: np.ndarray,
                     rb_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
+        r"""
         Compute SINR for all vehicles
+        严格按照论文公式(5)和(6)实现
+
+        公式(5): γ_k^v[m] = P_k^v[m]g_k[m] / (I_k[m] + σ²)
+        公式(6): I_k[m] = P_m^c[m]ḡ_{m,k}[m] + Σ_{k'∈K\k} ρ_{k'}[m]P_{k'}^v[m]ḡ_{k',k}[m]
+
         Args:
             power_linear: shape (n_vehicles,) in linear scale (Watts)
-            rb_indices: shape (n_vehicles,) RB indices selected by each vehicle
+            rb_indices: shape (n_vehicles,) RB indices selected by each vehicle (1-indexed: 1 to N_RB)
 
         Returns:
             sinr: shape (n_vehicles,) in linear scale
@@ -161,20 +269,29 @@ class ChannelModel:
         for i in range(self.n_vehicles):
             rb_idx = int(rb_indices[i])
 
-            # Desired signal on selected RB
-            if rb_idx > 0 and rb_idx <= self.n_rb:
-                desired_power = power_linear[i] * self.channel_gain[i, rb_idx - 1]  # RB索引从1开始
+            # 期望信号功率: P_k^v[m] * g_k[m]
+            # rb_idx范围: 1到N_RB，所以数组索引为rb_idx-1
+            if rb_idx >= 1 and rb_idx <= self.n_rb:
+                # 使用正确的RB
+                rb_array_idx = rb_idx - 1
+                desired_power = power_linear[i] * self.channel_gain[i, rb_array_idx]
             else:
-                desired_power = power_linear[i] * np.mean(self.channel_gain[i])  # 无效RB，使用平均
+                # 无效RB，使用平均信道增益
+                desired_power = power_linear[i] * np.mean(self.channel_gain[i])
+                rb_array_idx = 0
 
-            # Interference from other vehicles on same RB
+            # 干扰功率: 公式(6)
+            # I_k[m] = Σ_{k'∈K\k} ρ_{k'}[m]P_{k'}^v[m]ḡ_{k',k}[m]
+            # 其中ḡ_{k',k}[m] = interference_channel_gain[k', i, m] (从k'到i的信道增益)
             interference_power = 0
-            for j in range(self.n_vehicles):
-                if i != j:
-                    rb_idx_j = int(rb_indices[j])
-                    if rb_idx == rb_idx_j and rb_idx > 0:
-                        # Same RB: direct interference
-                        interference_power += power_linear[j] * self.channel_gain[j, rb_idx - 1]
+            if rb_idx >= 1 and rb_idx <= self.n_rb:
+                for j in range(self.n_vehicles):
+                    if i != j:
+                        rb_idx_j = int(rb_indices[j])
+                        if rb_idx == rb_idx_j:
+                            # Vehicle j在同一RB上发射，对vehicle i产生干扰
+                            # 使用干扰信道增益矩阵而非自身信道
+                            interference_power += power_linear[j] * self.interference_channel_gain[j, i, rb_array_idx]
 
             total_interference = interference_power + noise_power
             sinr[i] = desired_power / (total_interference + 1e-10)  # avoid division by zero

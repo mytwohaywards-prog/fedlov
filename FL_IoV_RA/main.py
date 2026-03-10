@@ -1,8 +1,12 @@
 """
-Main training and evaluation script for HMDQN-based IoV Resource Allocation
-Strictly follows the IEEE paper architecture with distributed learning
+Main training and evaluation script for FMDQN-based IoV Resource Allocation
+Strictly follows the IEEE paper: "Distributed Resource Allocation With Federated Learning
+for Delay-Sensitive IoV Services" - Algorithm 1: FMDQN Training Stage
+
+FMDQN = Federated Multi-agent DQN with periodic parameter aggregation
+
 Usage:
-    python main.py --mode train       # Train HMDQN model
+    python main.py --mode train       # Train FMDQN model
     python main.py --mode eval        # Evaluate all methods
 """
 
@@ -16,6 +20,7 @@ import matplotlib.pyplot as plt
 import config
 from env import IoVEnv
 from agents.dqn_agent import DQNAgent
+from agents.federal_server import FederalServer
 from agents.coordinator import DistributedCoordinator
 from baselines import RandomAllocation, EqualAllocation, GreedyAllocation
 from utils import (
@@ -24,8 +29,16 @@ from utils import (
 )
 
 
-class HMDQNTrainer:
-    """Trainer for Hybrid Multi-agent DQN (HMDQN) - Distributed Learning"""
+class FMDQNTrainer:
+    """
+    Trainer for Federated Multi-agent DQN (FMDQN)
+
+    Implements Algorithm 1: FMDQN Training Stage from the IEEE paper
+    - Each vehicle maintains a local Q-network (θ_l^k)
+    - Local training on experience replay buffer
+    - Periodic federated aggregation of parameters
+    - Synchronized global model distribution
+    """
 
     def __init__(self, cfg):
         self.config = cfg
@@ -34,6 +47,17 @@ class HMDQNTrainer:
         # Initialize DQN agents (one per vehicle)
         self.agents = [DQNAgent(i, self.env.obs_dim, self.env.n_actions, cfg)
                        for i in range(cfg.N_VEHICLES)]
+
+        # ========== FMDQN: Federal Server ==========
+        # Central server that manages global Q-network and aggregation
+        self.federal_server = FederalServer(
+            obs_dim=self.env.obs_dim,
+            n_actions=self.env.n_actions,
+            n_agents=cfg.N_VEHICLES,
+            config=cfg
+        )
+        # Register agents with server
+        self.federal_server.set_agents(self.agents)
 
         # Distributed coordinator
         self.coordinator = DistributedCoordinator(cfg.N_VEHICLES, cfg)
@@ -44,21 +68,31 @@ class HMDQNTrainer:
         self.episode_energies = []
         self.episode_constraint_satisfaction = []
 
-        print(f"[HMDQN Trainer] Initialized with {cfg.N_VEHICLES} distributed DQN agents")
+        print(f"[FMDQN Trainer] Initialized with {cfg.N_VEHICLES} federated DQN agents")
         print(f"  Obs dim: {self.env.obs_dim}, Action space: {self.env.n_actions} discrete actions")
         print(f"  Discrete action decomposition: RB={cfg.N_RB_ACTIONS}, Power={cfg.N_POWER_ACTIONS}, CPU={cfg.N_CPU_ACTIONS}")
+        print(f"  Federated Aggregation enabled: every {self.federal_server.aggregation_freq} episodes")
 
     def train(self, num_episodes: int = None):
         """
-        Training loop: Each agent learns independently with local experience replay
-        Agents communicate via coordinator to reduce conflicts
+        FMDQN Training Loop (Algorithm 1)
+
+        Workflow:
+        1. Each episode: All agents collect local experience
+        2. All agents perform local training (gradient steps)
+        3. Every F episodes: Execute Federated Aggregation
+           - Collect local parameters from all agents
+           - Compute global parameter average
+           - Sync all agents with global model
+        4. Repeat until convergence
+
         Args:
             num_episodes: number of training episodes (default: config.FL_ROUNDS)
         """
         if num_episodes is None:
             num_episodes = self.config.FL_ROUNDS
 
-        print(f"\n[Training] Starting {num_episodes} episodes of distributed HMDQN...")
+        print(f"\n[Training] Starting {num_episodes} episodes of FMDQN with federated aggregation...")
 
         for episode in range(num_episodes):
             # Reset environment
@@ -114,10 +148,18 @@ class HMDQNTrainer:
             self.episode_energies.append(stats['mean_energy'])
             self.episode_constraint_satisfaction.append(stats['constraint_satisfaction_rate'])
 
-            # ✅ 添加: 每个episode衰减epsilon (论文要求前800个episode线性衰减)
+            # ✅ Epsilon衰减 (论文Table II: 前800个episode线性衰减)
             for agent in self.agents:
                 agent.epsilon = max(agent.epsilon_end,
                                    agent.epsilon - (1.0 - agent.epsilon_end) / self.config.EPSILON_DECAY)
+
+            # ========== FMDQN: Federated Aggregation ==========
+            # 每F个episodes执行一次聚合 (Algorithm 1 Line 14)
+            if (episode + 1) % self.federal_server.aggregation_freq == 0:
+                aggregation_info = self.federal_server.aggregate()
+                if self.config.VERBOSE:
+                    print(f"[Federated Aggregation] Episode {episode + 1}: "
+                          f"Aggregation round {aggregation_info['aggregation_step']} completed")
 
             # Logging
             if (episode + 1) % self.config.LOG_INTERVAL == 0:
@@ -133,6 +175,12 @@ class HMDQNTrainer:
                       f"Buffer sizes: {[agent.get_buffer_size() for agent in self.agents[:3]]}...")
 
         print("[Training] Completed!")
+
+        # Print federated learning statistics
+        fed_stats = self.federal_server.get_aggregation_statistics()
+        print(f"[Federated Learning] Total aggregation rounds: {fed_stats['total_aggregations']}")
+
+        # Print coordinator statistics
         coordinator_stats = self.coordinator.get_stats()
         print(f"[Coordinator] RB conflicts: {coordinator_stats['total_rb_conflicts']}, "
               f"Power conflicts: {coordinator_stats['total_power_conflicts']}")
@@ -208,7 +256,7 @@ class Evaluator:
     def __init__(self, cfg):
         self.config = cfg
 
-    def evaluate_all_methods(self, trainer: HMDQNTrainer, num_episodes: int = 10) -> Dict:
+    def evaluate_all_methods(self, trainer: FMDQNTrainer, num_episodes: int = 10) -> Dict:
         """
         Evaluate all allocation methods
         Args:
@@ -220,9 +268,9 @@ class Evaluator:
         """
         results = {}
 
-        # 1. HMDQN (trained agents)
-        print("\n[Evaluate] Testing HMDQN...")
-        results['HMDQN'] = trainer.evaluate(num_episodes)
+        # 1. FMDQN (trained agents with federated learning)
+        print("\n[Evaluate] Testing FMDQN...")
+        results['FMDQN'] = trainer.evaluate(num_episodes)
 
         # 2. Random allocation
         print("[Evaluate] Testing Random allocation...")
@@ -308,7 +356,7 @@ class Evaluator:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description='HMDQN-based IoV Resource Allocation')
+    parser = argparse.ArgumentParser(description='FMDQN-based IoV Resource Allocation')
     parser.add_argument('--mode', type=str, default='train',
                        choices=['train', 'eval'],
                        help='Operating mode: train or eval')
@@ -328,7 +376,7 @@ def main():
 
     if args.mode == 'train':
         # Training mode
-        trainer = HMDQNTrainer(config)
+        trainer = FMDQNTrainer(config)
         train_results = trainer.train(args.episodes)
 
         # Save results
@@ -347,7 +395,7 @@ def main():
 
         # Plot convergence
         fig, ax = plot_convergence(train_results['rewards'],
-                                  title="HMDQN Training Convergence")
+                                  title="FMDQN Training Convergence (Federated Learning)")
         plt.savefig(f"{config.RESULTS_DIR}/convergence_{timestamp}.png", dpi=150)
         plt.close()
 
@@ -355,9 +403,9 @@ def main():
 
     elif args.mode == 'eval':
         # Evaluation mode
-        print("[Main] Training HMDQN for evaluation (20 episodes)...")
+        print("[Main] Training FMDQN for evaluation (20 episodes)...")
 
-        trainer = HMDQNTrainer(config)
+        trainer = FMDQNTrainer(config)
         trainer.train(num_episodes=20)
 
         # Evaluation
@@ -381,7 +429,7 @@ def main():
         save_results(eval_results_dict, results_path)
 
         # Print results
-        print_results(eval_results_dict, title="HMDQN vs Baseline Comparison")
+        print_results(eval_results_dict, title="FMDQN vs Baseline Comparison")
 
         # Plotting
         fig, ax = plot_comparison(

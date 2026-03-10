@@ -5,19 +5,26 @@ for Delay-Sensitive IoV Services - HMDQN Framework
 """
 
 # ============== Network Parameters ==============
-# 严格按照论文参数（V2V通信）
+# 严格按照论文参数（V2V通信 - Table I & II）
 N_VEHICLES = 10          # Number of vehicles (agents/VTLs)
 N_RB = 5                 # Number of resource blocks (sub-channels)
-BW_PER_RB = 5e6          # Hz, bandwidth per resource block (5 MHz per RB, total 25 MHz for 5 RBs)
-MAX_POWER = 23           # dBm, maximum transmit power
-NOISE_POWER_dBm = -114   # dBm, AWGN noise power
-CARRIER_FREQUENCY = 2e9  # Hz, carrier frequency (2 GHz)
+
+# 论文Table I: W = 3.6 MHz (总V2V带宽)
+# 5个RB分配: 3.6MHz / 5 = 0.72MHz per RB
+BW_PER_RB = 0.72e6       # Hz, bandwidth per resource block (0.72 MHz, total 3.6 MHz) ✓ 修正
+
+# 论文Table I: 频率为4.7 GHz (V2V通信频带)
+CARRIER_FREQUENCY = 4.7e9  # Hz, carrier frequency (4.7 GHz, NOT 2GHz) ✓ 修正
+
+MAX_POWER = 23           # dBm, maximum transmit power (论文Table I)
+NOISE_POWER_dBm = -114   # dBm, AWGN noise power (论文Table I)
 
 # ============== Computation Parameters ==============
-# 严格按照论文Table 1参数（V2V负载 = 2×1060 Bytes）
-MAX_CPU = 1e8            # Hz, maximum CPU frequency (100 MHz)
-TASK_SIZE = 16960        # bits, task size (2×1060 bytes = 8480 bytes = 67840 bits, 用16960为中值)
-CPU_CYCLES = 1e7         # cycles/task, computational complexity (10M cycles)
+# 严格按照论文Table I参数（V2V负载）
+MAX_CPU = 1e8            # Hz, maximum CPU frequency (100 MHz, 论文Table I)
+# V2V payload = 2 × 1060 bytes = 2120 bytes = 16960 bits (最大负载)
+TASK_SIZE = 16960        # bits, task size for V2V communication
+CPU_CYCLES = 1e8         # cycles/task, computational complexity per task
 TASK_ARRIVAL_RATE = 0.5  # tasks per time slot, poisson rate
 
 # ============== Delay and Cost Constraints (严格遵循论文Table 3) ==============
@@ -33,13 +40,39 @@ V_MAX = 30               # m/s, maximum vehicle speed
 SLOT_DURATION = 0.1      # seconds, time slot duration
 
 # ============== Channel Model ==============
-SHADOWING_STD = 8        # dB, log-normal shadowing std
-FADING_MODEL = "rayleigh"  # "rayleigh" or "nakagami"
-NAKAGAMI_M = 1           # Nakagami shape parameter (m=1 -> rayleigh)
-PATH_LOSS_EXPONENT = 4   # path loss exponent (urban)
-MIN_DISTANCE = 1         # meter, minimum distance to avoid singularity
+# 论文Table II指定不同条件下的阴影标准差
+SHADOWING_STD = 3        # dB, log-normal shadowing std for LOS (论文Table II: V2V LOS=3dB) ✓ 修正
+SHADOWING_STD_NLOS = 4   # dB, shadowing std for NLOS (论文Table II: V2V NLOS=4dB)
 
-# ============== DQN-specific Parameters (HMDQN) ==============
+# ========== 奖励函数参数（论文公式18-19） ==========
+# 严格按照论文Section III.A "Key Parameters Design of FMDQN"
+# 奖励函数: r_t(k) = ζ^net + λ₃G(γ_k^c - γ^th) + λ₄G(∑ρ_k[m]C_k^c[m] - B_k/T_k)
+# 从属函数: G(x) = A₂ if x>0 else x
+
+REWARD_LAMBDA3 = 0.5     # λ₃: SINR约束的权重 (论文未明确，需通过实验调整)
+REWARD_LAMBDA4 = 0.5     # λ₄: 传输速率约束的权重 (论文未明确，需通过实验调整)
+REWARD_A1 = -5.0         # A₁: 无数据时的固定奖励 (负值惩罚)
+REWARD_A2 = 1.0          # A₂: 约束满足时的固定奖励增益
+
+# SEE权重 (论文公式11: ζ^net = λ₁ζ^V2I + λ₂ζ^V2V)
+REWARD_LAMBDA1_SEE = 0.5 # λ₁: V2I SEE的权重
+REWARD_LAMBDA2_SEE = 0.5 # λ₂: V2V SEE的权重
+
+# ========== SINR阈值参数 ==========
+# 论文Table I: SINR_threshold = 1 dBm (严格模式)
+# 测试模式: SINR_threshold = 0.0 dBm (放宽，用于快速验证)
+SINR_THRESHOLD_dB = 1.0  # ← 恢复为论文要求的1.0 dBm
+FADING_MODEL = "rayleigh"  # "rayleigh" or "nakagami" (论文Table II: Rice/Rayleigh)
+NAKAGAMI_M = 1           # Nakagami shape parameter (m=1 -> rayleigh)
+PATH_LOSS_EXPONENT = 3.8 # path loss exponent (根据3GPP模型确定)
+MIN_DISTANCE = 1         # meter, minimum distance to avoid singularity
+DECORRELATION_DISTANCE = 10  # meters, decorrelation distance (论文Table II)
+
+# ============== FMDQN-specific Parameters ==============
+# Federated Learning Configuration (Algorithm 1)
+AGGREGATION_FREQ = 50                # 每50个episode执行一次联邦聚合 (Algorithm 1 Line 14)
+AGGREGATION_WEIGHTS = "equal"        # 聚合权重: "equal" = 所有agents等权重 (1/K)
+
 # Discrete Action Spaces
 N_RB_ACTIONS = N_RB + 1              # RB selection: 0 to N_RB (0=no RB)
 N_POWER_ACTIONS = 5                  # Power levels: 0 to 4 (0=0%, 4=100%)

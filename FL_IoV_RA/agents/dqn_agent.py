@@ -1,7 +1,12 @@
 """
-DQN Agent for HMDQN Framework
+DQN Agent for FMDQN Framework (Federated Multi-agent DQN)
 Implements Deep Q-Network with experience replay and target network
-Reference: DQN paper + HMDQN from Distributed Resource Allocation paper
+Supports federated learning with periodic parameter aggregation
+
+Reference:
+- DQN paper
+- Distributed Resource Allocation With Federated Learning for Delay-Sensitive IoV Services
+- Algorithm 1: FMDQN Training Stage with Federated Aggregation
 """
 
 import torch
@@ -19,13 +24,25 @@ from networks.dqn_network import (
 
 class DQNAgent:
     """
-    DQN Agent for distributed resource allocation in IoV
-    Each vehicle has its own DQN agent that learns independently
+    DQN Agent for FMDQN (Federated Multi-agent DQN) Framework
+
+    Workflow:
+    1. Each vehicle (agent) maintains a local Q-network θ_l^k
+    2. Agent trains locally on its own experience buffer
+    3. Periodically receives global Q-network θ_global from Federal Server
+    4. Syncs local network with global parameters
+    5. Continues training with updated network
+
+    This enables:
+    - Distributed training (each agent trains independently)
+    - Knowledge sharing (periodic aggregation of parameters)
+    - Faster convergence (global model as reference)
     """
 
     def __init__(self, agent_id: int, obs_dim: int, n_actions: int, config):
         """
-        Initialize DQN agent
+        Initialize DQN agent for FMDQN
+
         Args:
             agent_id: unique vehicle identifier
             obs_dim: observation dimension
@@ -39,7 +56,8 @@ class DQNAgent:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Q-network and target Q-network
+        # ========== Local Q-networks (θ_l^k) ==========
+        # These are the agent's local networks that will be updated
         self.q_network = QNetwork(obs_dim, n_actions).to(self.device)
         self.target_q_network = QNetwork(obs_dim, n_actions).to(self.device)
 
@@ -69,6 +87,11 @@ class DQNAgent:
         # Training step counter
         self.train_step = 0
         self.update_counter = 0
+
+        # ========== Federated Learning Tracking ==========
+        # Track participation in aggregation rounds
+        self.federated_round = 0  # Number of times this agent participated in aggregation
+        self.last_aggregation_step = 0
 
     def choose_action(self, obs: np.ndarray, exploration: bool = True) -> int:
         """
@@ -179,4 +202,45 @@ class DQNAgent:
             'epsilon': self.epsilon,
             'train_steps': self.train_step,
             'updates': self.update_counter,
+            'federated_rounds': self.federated_round,
         }
+
+    # ========== Federated Learning Interface ==========
+
+    def sync_from_global(self, global_params: Dict[str, torch.Tensor]):
+        """
+        Sync local Q-network with global model (θ_l^k := θ_global)
+
+        Called by Federal Server after aggregation to ensure all agents
+        have the same global model as starting point for next local training
+
+        Args:
+            global_params: dict of parameters from global Q-network
+        """
+        state_dict = self.q_network.state_dict()
+        for name, param in global_params.items():
+            if name in state_dict:
+                state_dict[name] = param.to(self.device)
+        self.q_network.load_state_dict(state_dict)
+
+        # Also sync target network to match
+        hard_update_dqn(self.target_q_network, self.q_network)
+
+        # Track aggregation
+        self.federated_round += 1
+        self.last_aggregation_step = self.train_step
+
+    def get_local_params(self) -> Dict[str, torch.Tensor]:
+        """
+        Get local Q-network parameters for aggregation (θ_l^k)
+
+        Called by Federal Server to collect parameters from all agents
+        for aggregation
+
+        Returns:
+            dict of local Q-network parameters on CPU
+        """
+        params = {}
+        for name, param in self.q_network.named_parameters():
+            params[name] = param.data.cpu().clone()
+        return params
